@@ -1,100 +1,100 @@
-const express = require('express');
-const session = require('express-session');
-const { Issuer, generators } = require('openid-client');
+require('dotenv').config();
+
+const express = require("express");
+const cookieParser = require('cookie-parser');
+const cors = require("cors");
+const client = require('openid-client');
+
+const authMiddleware = require('./authMiddleware');
+const { getCurrentUrl, getCognitoJWTPublicKey } = require('./utils');
+
+global.jwtSigningKey;
+let config;
+
+async function initializeServer() {
+    // Initialize OpenID Client
+    let server = new URL(`https://cognito-idp.${process.env.AWS_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}`)
+    let clientId = process.env.COGNITO_CLIENT_ID;
+    let clientSecret = process.env.COGNITO_CLIENT_SECRET;
+    config = await client.discovery(
+        server,
+        clientId,
+        clientSecret,
+    )
+    // Fetch PEM Key to verfiy ACCESS Token
+    jwtSigningKey = await getCognitoJWTPublicKey(server.href + "/.well-known/jwks.json ")
+};
+initializeServer().catch(console.error);
+
 const app = express();
+const port = process.env.PORT || 3000;
 
-let client;
-// Initialize OpenID Client
-async function initializeClient() {
-    const issuer = await Issuer.discover('https://cognito-idp.us-east-1.amazonaws.com/us-east-1_yoZX9xJPN');
-    client = new issuer.Client({
-        client_id: '2pn88vv1jgsuspp50q0vfc9gf1',
-        client_secret: '15odpmro74nm6767e1g1u28f3dlna9ak7osp95o6fjoh7051n0v4',
-        redirect_uris: ['http://localhost:3000/token'],
-        response_types: ['code']
-    });
-};
-initializeClient().catch(console.error);
+// List of allowed origins
+const allowedOrigins = ["http://localhost:5173",];
 
-app.use(session({
-    secret: 'some secret',
-    resave: false,
-    saveUninitialized: false
-}));
-
-const checkAuth = (req, res, next) => {
-    if (!req.session.userInfo) {
-        req.isAuthenticated = false;
-    } else {
-        req.isAuthenticated = true;
-    }
-    next();
+// CORS middleware
+const corsOptions = {
+    origin: allowedOrigins, // Pass the list of domains
+    methods: ["GET", "POST"], // Allow only GET and POST methods
+    allowedHeaders: ["Content-Type", "Authorization", "X-Custom-Header"], // Allow only these headers
+    credentials: true, // Allow credentials (cookies) to be sent,
+    maxAge: 10,
 };
 
-app.get('/', checkAuth, (req, res) => {
-    res.render('home', {
-        isAuthenticated: req.isAuthenticated,
-        userInfo: req.session.userInfo
-    });
-});
+// Enable CORS with the options
+app.use(cors(corsOptions));
 
-app.get('/login', (req, res) => {
-    const nonce = generators.nonce();
-    const state = generators.state();
+app.use(cookieParser(process.env.COOKIE_SECRET));
+app.use(authMiddleware)
 
-    req.session.nonce = nonce;
-    req.session.state = state;
-
-    const authUrl = client.authorizationUrl({
-        scope: 'email openid phone',
-        state: state,
-        nonce: nonce,
-    });
-
-    res.redirect(authUrl);
-});
-
-// Helper function to get the path from the URL. Example: "http://localhost/hello" returns "/hello"
-function getPathFromURL(urlString) {
-    try {
-        const url = new URL(urlString);
-        return url.pathname;
-    } catch (error) {
-        console.error('Invalid URL:', error);
-        return null;
+app.get('/login', async (req, res) => {
+    const code_verifier = client.randomPKCECodeVerifier();
+    const code_challenge = await client.calculatePKCECodeChallenge(code_verifier);
+    const state = client.randomState();
+    let parameters = {
+        redirect_uri: process.env.COGNITO_CALLBACK_URL,
+        code_challenge,
+        code_challenge_method: 'S256',
+        state
     }
-}
+    const congnitoLoginURL = client.buildAuthorizationUrl(config, parameters).href;
+    res.cookie('state', state, { httpOnly: true, signed: true });
+    res.cookie('code_verifier', code_verifier, { httpOnly: true, signed: true });
+    res.send(JSON.stringify({ congnitoLoginURL }));
+})
 
-app.get(getPathFromURL('http://localhost:3000/token'), async (req, res) => {
+app.get('/token', async (req, res) => {
     try {
-        const params = client.callbackParams(req);
-        const tokenSet = await client.callback(
-            'http://localhost:3000/token',
-            params,
+        const { state, code_verifier } = req.signedCookies;
+        // console.log(state, code_verifier, config, getCurrentUrl(req));
+        let tokens = await client.authorizationCodeGrant(
+            config,
+            getCurrentUrl(req),
             {
-                nonce: req.session.nonce,
-                state: req.session.state
-            }
-        );
-
-        const userInfo = await client.userinfo(tokenSet.access_token);
-        req.session.userInfo = userInfo;
-
-        res.redirect('/');
-    } catch (err) {
-        console.error('Callback error:', err);
-        res.redirect('/');
+                pkceCodeVerifier: code_verifier,
+                expectedState: state,
+            },
+        )
+        res.cookie('ACCESS_TOKEN', tokens.access_token, { httpOnly: true, signed: true });
+        res.cookie('REFRESH_TOKEN', tokens.refresh_token, { httpOnly: true, signed: true });
+        res.cookie('ID_TOKEN', tokens.id_token);
+        res.clearCookie("state");
+        res.clearCookie("code_verifier");
+        res.send(tokens)
     }
-});
+    catch (err) {
+        console.error(err);
+        res.status(500).send(err)
+    }
+})
 
-// Logout route
-app.get('/logout', (req, res) => {
-    req.session.destroy();
-    const logoutUrl = `https://us-east-1yozx9xjpn.auth.us-east-1.amazoncognito.com/logout?client_id=2pn88vv1jgsuspp50q0vfc9gf1&logout_uri=http://localhost:3000`;
-    res.redirect(logoutUrl);
-});
+app.get('/todos', (req, res) => {
+    const todos = ["task1", "task2", "task3"];
+    const adminTodos = ["adminTask1", "admiTask2", "adminTask3"];
+    const isAdmin = JSON.parse(Buffer.from(req?.signedCookies?.ACCESS_TOKEN?.split('.')[1], 'base64')?.toString('utf8'))['cognito:groups']?.includes('Admin');
+    res.send(isAdmin ? adminTodos : todos)
+})
 
-app.set('view engine', 'ejs');
-app.listen(3000, () => {
-    console.log('Server is running on http://localhost:3000');
-});
+app.listen(port, () => {
+    console.log("Server Started on port " + port);
+})
